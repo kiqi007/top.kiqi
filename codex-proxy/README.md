@@ -1,55 +1,50 @@
 # codex-proxy
 
-`codex-proxy` 是 Codex Desktop 的 Go 启动器。Desktop 向启动器的标准输入输出读写 JSONL，启动器启动真实的 `codex app-server --listen unix://…`，并在 JSONL 与 Unix socket 上的 WebSocket 文本帧之间双向转发消息。另一个本机客户端可以独立连接同一个 socket，由 app-server 管理连接、线程和消息订阅。
+`codex-proxy` 是一个 Go 启动器，让 Codex Desktop 和其他本机客户端可以连接同一个 `codex app-server`。
 
-```text
-Codex Desktop ── stdio / JSONL ── codex-proxy ── WebSocket over Unix socket ── codex app-server
-本机外部客户端 ────────────────────────────────── WebSocket over Unix socket ────────┘
+## 架构
+
+```mermaid
+flowchart LR
+    Desktop[Codex Desktop] <-->|stdio / JSONL| Helper[codex-proxy]
+    Helper <-->|WebSocket / Unix socket| Server[codex app-server]
+    Client[本机外部客户端] <-->|WebSocket / 同一个 Unix socket| Server
 ```
 
-## 构建与启动
+1. Codex Desktop 通过 `CODEX_CLI_PATH` 启动 `codex-proxy`，并通过标准输入和输出交换 JSONL 消息。
+2. `codex-proxy` 启动真实的 Codex CLI，让 `app-server` 监听本地 Unix socket，并在 JSONL 和 WebSocket 消息之间双向转发。
+3. 外部客户端可直接通过该 socket 建立独立的 WebSocket 连接。每条连接各自初始化，使用同一个 `threadId` 即可访问同一条 Codex 会话。
 
-需要 Go 1.23+、macOS 或 Linux，以及支持 `app-server --listen unix://PATH` 的 Codex CLI。已在 macOS 使用 `codex-cli 0.171.0-alpha.13` 验证。
+## 构建
 
-在项目目录执行 `go build -o bin/codex-proxy .`。在 macOS 完全退出正在运行的 Codex Desktop 后，执行下面的命令。`app` 填写本机的实际应用路径，`real_codex` 填写与 Desktop 配套的真实 CLI 的绝对路径。可以用 `command -v codex` 查找当前终端里的 CLI。
+需要 Go 1.23 或更高版本。在仓库根目录运行 `make -C codex-proxy`，生成 `codex-proxy/bin/codex-proxy`。如果已经在 Go 模块目录内，直接运行 `make` 即可。
+
+## 从 Dock 或访达启动 Codex Desktop
+
+需要支持 `app-server --listen unix://PATH` 的 Codex CLI。先用 `⌘Q` 完全退出 Codex Desktop，然后在 macOS 的终端中，从仓库根目录执行以下配置。将 `real_codex` 改为本机真实 CLI 的绝对路径。若已将 helper 安装到固定位置，可将 `helper` 改为该文件的绝对路径。
 
 ```sh
-app='/Applications/ChatGPT.app'
-real_codex='/absolute/path/to/real/codex'
+helper="$PWD/codex-proxy/bin/codex-proxy"
+real_codex='/absolute/path/to/codex'
 socket_dir="/tmp/cp-$(id -u)"
 
-open -a "$app" \
-  --env "CODEX_CLI_PATH=$PWD/bin/codex-proxy" \
-  --env "CODEX_PROXY_REAL_CODEX=$real_codex" \
-  --env "CODEX_PROXY_SOCKET_DIR=$socket_dir"
+launchctl setenv CODEX_CLI_PATH "$helper"
+launchctl setenv CODEX_PROXY_REAL_CODEX "$real_codex"
+launchctl setenv CODEX_PROXY_SOCKET_DIR "$socket_dir"
 ```
 
-`CODEX_CLI_PATH` 是 Desktop 进程的环境变量，值是可执行文件的路径。Desktop 自行传入 `app-server` 和启动参数。`CODEX_PROXY_REAL_CODEX` 缺省时，启动器在 `PATH` 中查找 `codex`。实际启动的 app-server 继承 Desktop 子进程的环境，读取自己的 Codex 配置和数据目录。
+配置后，从 Dock 或访达点击原来的 Codex Desktop 图标即可启动。在同一次 macOS 登录期间，退出后可继续点击图标重新打开。注销或重启 Mac 后，需要重新配置这些变量。
 
-`CODEX_PROXY_SOCKET_DIR` 指定一个尚不存在的绝对目录。启动器会以 `0700` 创建目录，socket 文件名为 `app.sock`，并在退出时清理。省略该变量时，每次启动使用新的 `/tmp/codex-proxy-*` 目录，完整地址写到 stderr。若强制终止后旧目录残留，可以在确认旧进程已退出后使用一个新的目录路径。
+- `CODEX_CLI_PATH` 指定 Desktop 启动的 helper。
+- `CODEX_PROXY_REAL_CODEX` 指定 helper 调用的真实 CLI。省略时从 helper 的 `PATH` 查找 `codex`。
+- `CODEX_PROXY_SOCKET_DIR` 指定一个尚不存在的绝对目录。helper 创建目录及其中的 `app.sock`，并在正常退出时清理。省略时使用临时目录，并将地址写到 stderr。
 
-启动器桥接 Desktop 默认的 stdio 启动方式。`--version`、`app-server --help`、`app-server daemon` 和显式传输参数交给真实 CLI 处理。
+## 连接本地 socket
 
-## 外部客户端
-
-另一终端可以用支持 Unix socket 的 Codex TUI 连接。若使用了上面的固定目录，执行 `codex --remote "unix:///tmp/cp-$(id -u)/app.sock"`。自定义客户端应通过该 Unix socket 完成 HTTP Upgrade，再发送 `initialize` 请求和 `initialized` 通知。可以通过 `thread/loaded/list` 查询当前已加载的线程，通过 `thread/resume` 恢复有可用历史记录的线程。事件投递和审批行为由 app-server 的协议和订阅管理，连接成功只完成传输层握手。
-
-## 飞书方案核对
-
-| 方案表述 | 核对结果 |
-| --- | --- |
-| `CODEX_CLI_PATH` 指向 `codex app-server` | 应写为「`CODEX_CLI_PATH` 指向 Codex CLI 可执行文件，Desktop 以 `app-server` 子命令启动它」。本机 Desktop 的 CLI 启动分支默认使用 stdio。 |
-| helper 启动 Unix socket app-server，代理 stdio 和 socket | 架构成立。具体传输方式是 stdio 上的 JSONL 与 Unix socket 上的 WebSocket 文本消息之间的桥接。 |
-| 外部端用 socket 介入会话 | 外部端可新建连接并操作同一 app-server 中的线程。每条连接独立初始化，客户端按协议选择要操作或订阅的线程。 |
-| 编译 helper 后修改 Codex 配置即可 | 应写明在 Desktop 进程的环境中设置 `CODEX_CLI_PATH` 并重新启动应用，同时确保 helper 能定位到兼容的真实 CLI，以及外部客户端知道 socket 路径。 |
-
-协议参考 [OpenAI 的 Codex App Server 文档](https://learn.chatgpt.com/docs/app-server#protocol)。
-
-## 验证
+使用上面的固定目录时，可在另一个终端运行：
 
 ```sh
-go test ./...
-CODEX_PROXY_TEST_CODEX="$(command -v codex)" go test -v ./...
+codex --remote "unix:///tmp/cp-$(id -u)/app.sock"
 ```
 
-集成测试使用独立的 `CODEX_HOME`，按本机 Desktop 的参数启动 helper。stdio 客户端创建线程，另一个 Unix socket 客户端查询到同一线程并更新名称，stdio 客户端收到更新通知。测试也检查外部客户端断开后主连接仍可请求，以及 helper 退出后 socket 目录被清理。测试不发起模型请求。
+自定义客户端通过 Unix socket 建立 WebSocket 连接，然后发送 `initialize` 请求和 `initialized` 通知。协议细节见 [Codex App Server 文档](https://learn.chatgpt.com/docs/app-server#protocol)。
