@@ -4,16 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
-	"syscall"
+	"strings"
 	"testing"
 	"time"
 
+	"codex-proxy/mac"
+	"codex-proxy/windows"
+
+	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 )
 
@@ -23,6 +29,8 @@ func TestBridgesStdio(t *testing.T) {
 		want bool
 	}{
 		{[]string{"app-server"}, true},
+		{[]string{"app-server", "--listen", "stdio://"}, true},
+		{[]string{"app-server", "--stdio"}, true},
 		{[]string{"-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled"}, true},
 		{[]string{"app-server", "-c", `title="daemon"`}, true},
 		{[]string{"app-server", "--listen=off"}, false},
@@ -33,7 +41,7 @@ func TestBridgesStdio(t *testing.T) {
 		{[]string{"--version"}, false},
 		{[]string{"exec", "app-server"}, false},
 	} {
-		if got := bridgesStdio(tc.args); got != tc.want {
+		if _, got := sharedServerArgs(tc.args); got != tc.want {
 			t.Errorf("bridgesStdio(%q) = %t, want %t", tc.args, got, tc.want)
 		}
 	}
@@ -44,9 +52,21 @@ func TestSharedAppServer(t *testing.T) {
 	if codex == "" {
 		t.Skip("set CODEX_PROXY_TEST_CODEX to a compatible Codex CLI to run this test")
 	}
+	for _, transport := range []string{"unix", "websocket", "unix-path", "websocket-path"} {
+		if strings.HasPrefix(transport, "unix") && runtime.GOOS == "windows" {
+			continue
+		}
+		t.Run(transport, func(t *testing.T) { testSharedAppServer(t, codex, transport) })
+	}
+}
+func testSharedAppServer(t *testing.T, codex, transport string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	dir, err := os.MkdirTemp("/tmp", "codex-proxy-test-")
+	tempBase := ""
+	if runtime.GOOS == "darwin" {
+		tempBase = "/tmp"
+	}
+	dir, err := os.MkdirTemp(tempBase, "codex-proxy-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,12 +77,19 @@ func TestSharedAppServer(t *testing.T) {
 	}
 	socketDir := filepath.Join(dir, "socket")
 	binary := filepath.Join(dir, "codex-proxy")
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
+	}
 	build := exec.CommandContext(ctx, "go", "build", "-o", binary, ".")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build helper: %v\n%s", err, output)
 	}
 	cmd := exec.CommandContext(ctx, binary, "-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled")
-	cmd.Env = append(os.Environ(), "CODEX_HOME="+home, "CODEX_PROXY_SOCKET_DIR="+socketDir, "CODEX_PROXY_REAL_CODEX="+codex)
+	fixedPath := ""
+	if strings.HasSuffix(transport, "-path") {
+		fixedPath = filepath.Join(dir, "private socket", "custom.sock")
+	}
+	cmd.Env = append(os.Environ(), "CODEX_HOME="+home, "CODEX_PROXY_SOCKET_DIR="+socketDir, "CODEX_PROXY_SOCKET_PATH="+fixedPath, "CODEX_PROXY_REAL_CODEX="+codex, "CODEX_PROXY_TRANSPORT="+strings.TrimSuffix(transport, "-path"))
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -82,7 +109,7 @@ func TestSharedAppServer(t *testing.T) {
 	}
 	defer func() {
 		if cmd.ProcessState == nil {
-			_ = cmd.Process.Signal(syscall.SIGTERM)
+			_ = stdin.Close()
 			_ = cmd.Wait()
 		}
 		if t.Failed() {
@@ -104,7 +131,31 @@ func TestSharedAppServer(t *testing.T) {
 		t.Fatal("missing thread id")
 	}
 
-	conn, err := waitForSocket(ctx, filepath.Join(socketDir, "app.sock"))
+	var conn *websocket.Conn
+	var descriptor string
+	if fixedPath != "" {
+		descriptor = fixedPath
+		conn, err = mac.DialSocket(ctx, fixedPath)
+	} else if transport == "websocket" {
+		descriptor = filepath.Join(socketDir, fmt.Sprintf("desktop-%d.json", cmd.Process.Pid))
+		data, readErr := os.ReadFile(descriptor)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		var e windows.Endpoint
+		if err = json.Unmarshal(data, &e); err != nil {
+			t.Fatal(err)
+		}
+		bad := e
+		bad.Token = "wrong"
+		if denied, err := bad.Dial(ctx); err == nil {
+			denied.CloseNow()
+			t.Fatal("accepted wrong token")
+		}
+		conn, err = e.Dial(ctx)
+	} else {
+		conn, err = mac.DialSocket(ctx, filepath.Join(socketDir, "app.sock"))
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,13 +197,16 @@ func TestSharedAppServer(t *testing.T) {
 	if !slices.Contains(loaded.Data, started.Thread.ID) {
 		t.Fatal("desktop lost the thread after the external client disconnected")
 	}
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := stdin.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := cmd.Wait(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(socketDir); !errors.Is(err, fs.ErrNotExist) {
+	if transport == "unix" {
+		descriptor = socketDir
+	}
+	if _, err := os.Stat(descriptor); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("socket directory remained after shutdown: %v", err)
 	}
 }

@@ -2,21 +2,21 @@ package main
 
 import (
 	"bufio"
-
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
+
+	"codex-proxy/mac"
+	"codex-proxy/windows"
 
 	"github.com/coder/websocket"
 )
@@ -38,34 +38,53 @@ func main() {
 	}
 }
 
+// A transport configures the child and connects Desktop to the same instance as dsh.
+type transport interface {
+	Configure(*exec.Cmd) error
+	Connect(context.Context) (*websocket.Conn, error)
+	Close()
+}
+
 func run(ctx context.Context, args []string) error {
+	if len(args) == 2 && args[0] == "--dsh-socket-relay" {
+		return windows.RelaySocket(args[1])
+	}
 	codex, err := findCodex()
 	if err != nil {
 		return err
 	}
-	if !bridgesStdio(args) {
+	serverArgs, shared := sharedServerArgs(args)
+	if !shared {
 		cmd := exec.CommandContext(ctx, codex, args...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		return cmd.Run()
 	}
 
-	dir, err := makeSocketDir(os.Getenv("CODEX_PROXY_SOCKET_DIR"))
-	if err != nil {
-		return fmt.Errorf("create socket directory: %w", err)
+	dir, path := os.Getenv("CODEX_PROXY_SOCKET_DIR"), os.Getenv("CODEX_PROXY_SOCKET_PATH")
+	if path != "" {
+		if err := prepareSocketPath(path); err != nil {
+			return err
+		}
 	}
-	path := filepath.Join(dir, "app.sock")
-	defer func() {
-		os.Remove(path)
-		os.Remove(dir)
-	}()
-
+	var link transport
+	if runtime.GOOS == "windows" || os.Getenv("CODEX_PROXY_TRANSPORT") == "websocket" {
+		link = &windows.Transport{Dir: dir, Path: path}
+	} else {
+		link = &mac.Transport{Dir: dir, Path: path}
+	}
+	defer link.Close()
 	serverCtx, stopServer := context.WithCancel(ctx)
-	cmd := exec.CommandContext(serverCtx, codex, append(args, "--listen", "unix://"+path)...)
+	defer stopServer()
+	cmd := exec.CommandContext(serverCtx, codex, serverArgs...)
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	if err := link.Configure(cmd); err != nil {
+		return err
+	}
+	if runtime.GOOS != "windows" {
+		cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	}
 	cmd.WaitDelay = 2 * time.Second
 	if err := cmd.Start(); err != nil {
-		stopServer()
 		return fmt.Errorf("start Codex app-server: %w", err)
 	}
 	done := make(chan struct{})
@@ -90,14 +109,13 @@ func run(ctx context.Context, args []string) error {
 	}()
 
 	startupCtx, cancelStartup := context.WithTimeout(sessionCtx, 15*time.Second)
-	conn, err := waitForSocket(startupCtx, path)
+	conn, err := link.Connect(startupCtx)
 	cancelStartup()
 	if err == nil {
 		defer conn.CloseNow()
-		fmt.Fprintln(os.Stderr, "codex-proxy: listening at unix://"+path)
 		err = bridge(sessionCtx, conn, os.Stdin, os.Stdout)
 	} else {
-		err = fmt.Errorf("connect to Codex app-server at %s: %w", path, err)
+		err = fmt.Errorf("connect to Codex app-server: %w", err)
 	}
 	select {
 	case <-done:
@@ -139,79 +157,50 @@ func findCodex() (string, error) {
 	return path, nil
 }
 
-func bridgesStdio(args []string) bool {
+func sharedServerArgs(args []string) ([]string, bool) {
+	result := make([]string, 0, len(args))
 	appServer := false
 	for i := 0; i < len(args); i++ {
+		start := i
 		arg, _, hasValue := strings.Cut(args[i], "=")
 		switch arg {
 		case "-c", "--config", "-p", "--profile", "--enable", "--disable",
 			"--startup-client-info", "--cloud-skills-snapshot", "--code-mode-host":
 			if !hasValue {
 				i++
+				if i >= len(args) {
+					return nil, false
+				}
 			}
 		case "app-server":
 			if appServer {
-				return false
+				return nil, false
 			}
 			appServer = true
 		case "--analytics-default-enabled", "--startup-sign-out", "--strict-config":
 		case "--stdio":
-			// The CLI accepts an explicit stdio flag as well as its default.
-			// Preserve explicit transport selections by passing the command through.
-			return false
+			continue
+		case "--listen":
+			_, value, inline := strings.Cut(args[i], "=")
+			if !inline {
+				i++
+				if i >= len(args) {
+					return nil, false
+				}
+				value = args[i]
+			}
+			if value != "stdio://" {
+				return nil, false
+			}
+			continue
 		default:
 			if !strings.HasPrefix(arg, "-c") || strings.HasPrefix(arg, "--") {
-				return false
+				return nil, false
 			}
 		}
+		result = append(result, args[start:i+1]...)
 	}
-	return appServer
-}
-
-func makeSocketDir(dir string) (string, error) {
-	if dir == "" {
-		// macOS TMPDIR paths can exceed the Unix socket path length limit.
-		return os.MkdirTemp("/tmp", "codex-proxy-")
-	}
-	if !filepath.IsAbs(dir) {
-		return "", errors.New("CODEX_PROXY_SOCKET_DIR must be an absolute path")
-	}
-	dir = filepath.Clean(dir)
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		return "", err
-	}
-	return dir, nil
-}
-
-func waitForSocket(ctx context.Context, path string) (*websocket.Conn, error) {
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", path)
-		},
-	}
-	defer transport.CloseIdleConnections()
-	client := &http.Client{
-		Transport: transport,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		conn, _, err := websocket.Dial(ctx, "ws://localhost/", &websocket.DialOptions{HTTPClient: client})
-		if err == nil {
-			return conn, nil
-		}
-		if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ECONNREFUSED) {
-			return nil, err
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-ticker.C:
-		}
-	}
+	return result, appServer
 }
 
 func bridge(ctx context.Context, conn *websocket.Conn, input io.Reader, output io.Writer) error {

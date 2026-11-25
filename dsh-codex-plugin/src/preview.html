@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Codex 会话窗 · dsh Web 预览</title>
+<style>
+  *{box-sizing:border-box}body{margin:0;font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;color:#373c45;background:#fafbfc}
+  header{height:52px;display:flex;align-items:center;gap:12px;padding:0 22px;border-bottom:1px solid #e2e5ea;background:white}
+  header span{color:#8b929b}main{display:grid;place-content:center;height:80vh;text-align:center}h1{font-size:26px;letter-spacing:-.03em}p{color:#657080}
+  @media(prefers-color-scheme:dark){body{background:#17191c;color:#dce0e5}header{background:#202226;border-color:#373941}}
+</style>
+<header><b>DeepSeek Harness</b><span>/</span>工作区</header>
+<main><h1>dsh 工作区</h1><p>从右上方的独立悬浮栏打开 Codex 会话窗。</p></main>
+<div id="launcher"></div>
+<!-- bundled-client -->
+<script>
+  const user = text => ({role:'user',text})
+  const answer = text => ({role:'agent',phase:'final_answer',text})
+  const note = text => ({role:'agent',phase:'commentary',text})
+  const tool = (label,text,output='') => ({role:'tool',label,text,output})
+  let demoStart = new Date(2026,10,25,21,40).getTime()
+  function turn(id,status,durationMs,messages) {
+    demoStart += 60000
+    return {meta:{id,status,durationMs,startedAt:demoStart/1000,completedAt:durationMs && (demoStart+durationMs)/1000,detailsLoaded:true},messages:messages.map((m,i)=>({...m,id:id+'-'+i,turnId:id}))}
+  }
+  const cards = [
+    ['proxy','codex-proxy','会话断线恢复',[
+      turn('p0','completed',64000,[user('重连时会重复显示消息吗？'),note('我检查了事件序列和恢复逻辑。'),answer('已找到重复显示的原因。恢复订阅时，历史消息和实时事件可能包含同一个条目。')]),
+      turn('p1','inProgress',null,[user('加一个回归测试，覆盖断线后继续输出的情况。'),note('正在用两个客户端复现断线重连，并核对恢复前后的消息顺序。'),tool('读取文件','codex-proxy/main_test.go'),tool('运行测试','go test ./... -run TestReconnect','=== RUN   TestReconnect\n正在等待第二个客户端接入…')])
+    ]],
+    ['ui','dsh-web','调整会话输入框',[
+      turn('u0','completed',43000,[user('把消息输入框改得更接近 Codex。'),tool('读取组件','src/components/Composer.tsx'),answer('已调整输入框的圆角和内边距。发送按钮固定在右侧，输入多行内容时保留阅读空间。')]),
+      turn('u1','inProgress',null,[user('再补上键盘交互。'),note('已定位到输入框组件。将保留中文输入法的候选状态，并区分发送和换行。'),tool('准备修改','src/components/Composer.tsx')])
+    ]],
+    ['config','workspace','核对开发环境配置',[
+      turn('c0','completed',49000,[user('工作区配置里哪些字段决定连接地址？'),note('正在核对配置来源。'),answer('连接地址来自 **socketPath**。未指定时，插件读取宿主的 `CODEX_PROXY_SOCKET_DIR`。')]),
+      turn('c1','completed',86000,[user('整理成一份检查结果，方便我交接。'),tool('检查配置','config/workspace.yaml'),answer('**连接检查** :white_check_mark:\n\n| 检查项 | 结果 |\n| --- | --- |\n| Unix socket | 已连接 |\n| 环境隔离 | 开发与测试独立 |\n| Web 端 | 验证通过 |\n\n交接时可查阅[插件说明](./README.md)与[连接配置](./README.md#安装与配置)。')])
+    ]],
+    ['docs','docs','核对交接文档与接入方案',[
+      turn('d0','completed',27000,[user('把交接文档里的启动命令校对一遍。'),answer('已校对启动方式。\n\n[交互预览](./preview.html) · [查看效果图](./preview.png) · [查看接入方案](./README.md)')])
+    ]],
+    ['build','build','复核构建产物',[
+      turn('b0','inProgress',null,[user('检查构建产物是否包含浏览器插件。'),note('正在核对插件清单与入口文件。')])
+    ]],
+    ['tests','tests','检查回归测试',[
+      turn('t0','completed',21000,[user('运行现有的回归测试。'),answer('现有的回归测试已通过。')])
+    ]],
+    ['layout','web','核对窄屏会话标题与输入区间距',[]],
+    ['assets','web','整理界面截图和设计交付文件',[]],
+    ['release','release','复核发布记录与版本说明',[]]
+  ].map(([id,cwd,title,history])=>{
+    const active = history.find(t=>t.meta.status==='inProgress')
+    return {id,cwd:'/workspace/'+cwd,title,model:'gpt-6.2-sol',modelLabel:'GPT-6.2-Sol',effort:id==='config'?'high':'medium',tier:id==='proxy'?'priority':null,status:{type:active?'active':'idle'},turn:active?.meta.id??null,
+      turns:history.map(t=>t.meta),messages:history.flatMap(t=>t.messages),
+      approvals:id==='ui'?[{kind:'文件修改',token:'demo',scope:'src/components/Composer.tsx',decisions:['accept','decline']}]:[]}
+  })
+  let seq=0, revision=1
+  function makeApi() {
+    let bound=[], visible=[]
+    async function call(method,p) {
+      if (method==='list') return cards
+      if (method==='watch'){bound=p.ids;visible=p.visibleIds;revision++}
+      const c = cards.find(c=>c.id===p.threadId)
+      if (method==='edit') {
+        const at = c.turns.findIndex(t=>t.id===p.turnId)
+        if (c.turn || at<0 || c.turns.at(-1)?.id !== p.expectedTail) throw Error('会话记录已变化')
+        const removed = new Set(c.turns.splice(at).map(t=>t.id))
+        c.messages = c.messages.filter(m=>!removed.has(m.turnId))
+        method = 'send'
+      }
+      if (method==='send'||method==='decide'){
+        if (!c.turn) {
+          c.turn='demo-'+(++seq);c.turns.push({id:c.turn,status:'inProgress',startedAt:Date.now()/1000,detailsLoaded:true})
+        }
+        const id=c.turn, meta=c.turns.find(t=>t.id===id)
+        const append=m=>c.messages.push({...m,turnId:id,id:'item-'+(++seq)})
+        if (method==='send') append({...user(p.text),images:(p.images||[]).map((url,i)=>({url,name:'图片 '+(i+1)}))})
+        else c.approvals=[]
+        append(note(method==='send'?'已收到指令，正在检查本地示例。':'已收到本次审批决定。'))
+        c.status={type:'active'};revision++
+        setTimeout(()=>{
+          if(c.turn!==id || c.approvals.length) return
+          append(answer(method==='send'?'示例指令已处理。':p.decision==='accept'?'已应用示例修改。现在 Enter 发送，Shift+Enter 换行。':'已取消本次文件修改。'))
+          c.status={type:'idle'};c.turn=null;meta.status='completed';meta.durationMs=2400;meta.completedAt=Date.now()/1000;revision++
+        },2400)
+        return true
+      }
+      return revision===p.revision?{revision}:{revision,bound:cards.filter(c=>bound.includes(c.id)).map(c=>({id:c.id,title:c.title,status:c.status,awaitingApproval:!!c.approvals.length})),cards:structuredClone(visible.map(id=>cards.find(c=>c.id===id)))}
+    }
+    const readDemo = path => {
+      if (!location.protocol.startsWith('file')) return
+      const url = new URL(path,location.href)
+      if (url.pathname === new URL('./README.md',location.href).pathname) return /* plugin-readme */ null
+    }
+    return {demo:true,call,readDemo}
+  }
+  window.mountCodexLauncher(document.querySelector('#launcher'),makeApi,true)
+</script>
+</html>
