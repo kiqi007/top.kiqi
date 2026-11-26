@@ -154,6 +154,9 @@ import launcherArt from './launcher.svg'
     .background-dialog header small{margin-inline:auto 8px;color:var(--muted)}.background-dialog p{color:var(--muted);font-size:13px}.background-dialog p:empty{display:none}.gallery{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:12px}.gallery-tile{position:relative}.gallery-tile img{width:100%;height:60px;display:block;object-fit:cover;border-radius:8px}.gallery-tile button{position:absolute;right:3px;top:3px;border:0;background:#222a;color:white;border-radius:50%;width:20px;height:20px;padding:0}
     .gallery-tile{cursor:grab;touch-action:none;user-select:none;border-radius:8px}.gallery-tile.order-source{cursor:grabbing}
     .wash-control{display:flex;align-items:center;gap:9px;margin:14px 0;font-size:13px}.wash-control input{flex:1;min-width:45px;accent-color:var(--accent)}.wash-control output{min-width:4ch;text-align:end;font-variant-numeric:tabular-nums}
+    .picker-search{display:block;width:100%;margin:12px 0 8px;padding:8px 10px;font:inherit;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:7px}
+    .picker-caption,.picker-status,.row time,.row small{font-size:12px;color:var(--muted)}dialog .rows{margin:4px 0}.rows .row{padding:7px 4px;border-radius:5px}.rows .row:hover{background:var(--soft)}
+    .row .picker-text{flex:1;min-width:0}.picker-text span,.picker-text small{display:block;text-overflow:ellipsis;overflow:hidden;white-space:nowrap}.row time{flex:none;align-self:flex-start}.picker-more{margin:6px 0}.picker-status{display:block}
     .preview-dialog{width:min(1120px,96vw);max-width:96vw;height:min(860px,92dvh);max-height:94dvh;padding:0;overflow:hidden}
     .preview-dialog[open]{display:flex;flex-direction:column}.preview-dialog header{flex:none;gap:9px;border-bottom:1px solid var(--line);padding:7px 12px}.preview-dialog header strong{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}
     .preview-body{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain}.preview-body>.rich{max-width:48rem;margin:auto;padding:26px clamp(15px,4vw,48px) 48px;font-size:16px}
@@ -416,7 +419,7 @@ import launcherArt from './launcher.svg'
       <div class="stats"><i class="dot"></i><span class="connection">正在连接</span><span class="counts"></span></div>
       <div class="actions"><button class="bare backgrounds" aria-label="背景图库" title="背景图库">${icon('picture')}</button><button class="bare close" aria-label="关闭会话窗" title="关闭会话窗">${icon('close')}</button></div></header>
       <p role="status" class="alert" hidden></p><div class="grid"></div><p class="empty" hidden></p>
-      <dialog aria-label="绑定会话"><header>绑定会话<button class="bare cancel" aria-label="关闭">${icon('close',14)}</button></header><small>最多绑定 8 个会话，同时显示 4 个。<span class="quota"></span></small><div class="rows"></div></dialog>
+      <dialog aria-label="绑定会话"><header>绑定会话<button class="bare cancel" aria-label="关闭">${icon('close',14)}</button></header><small>最多绑定 8 个会话，同时显示 4 个。<span class="quota"></span></small><input class="picker-search" type="search" aria-label="搜索会话" placeholder="搜索会话标题、项目路径或 ID"><div class="picker-caption">最近活动优先</div><div class="rows"></div><button class="picker-more" hidden>加载更早会话</button><small class="picker-status" role="status"></small></dialog>
       <dialog class="background-dialog" aria-label="背景图库"><header>背景图库<small></small><button class="bare gallery-close" aria-label="关闭图库">${icon('close',14)}</button></header><div class="gallery"></div><p>拖动图片调整背景顺序，最多 8 张。</p><label class="wash-control">背景遮罩<input type="range" min="0" max="100" step="1"><output></output></label><button class="add-background">添加图片</button><input type="file" multiple hidden><p role="status"></p></dialog>
       <dialog class="preview-dialog" aria-labelledby="preview-title"><header><button class="bare preview-back" aria-label="返回上一份预览">‹</button><strong id="preview-title"></strong><button class="bare preview-close" aria-label="关闭预览">${icon('close')}</button></header><div class="preview-body"></div></dialog></div>`
     const style = document.createElement('style')
@@ -443,6 +446,8 @@ import launcherArt from './launcher.svg'
     const shortcuts = new Map()
     const pickerRows = new Map()
     const dlg = $('dialog')
+    const search = $('.picker-search'), more = $('.picker-more'), pickerStatus = $('.picker-status')
+    let catalogCursor = null, picker = null, searchTimer
     const preview = makePreview($('.preview-dialog'))
     const alert = text => { $('.alert').textContent = text; $('.alert').hidden = !text }
     function connection(on) {
@@ -695,7 +700,8 @@ import launcherArt from './launcher.svg'
     async function tick() {
       try {
         if (!connected || ticks++ % 20 === 0) {
-          catalog = await api.call('list',{connect:!connected, bound:initialized ? selection.ids : saved?.ids})
+          const page = await api.call('list',{connect:!connected, paged:true, bound:initialized ? selection.ids : saved?.ids})
+          catalog = page.rows; catalogCursor = page.nextCursor
         }
         if (dead) return
         if (!connected) {
@@ -711,23 +717,64 @@ import launcherArt from './launcher.svg'
       } catch(e) { if (!dead) { connection(false); alert(e.message) } }
       if (!dead) timer = setTimeout(tick,connected ? 650 : 3000)
     }
-    $('.choose').onclick = () => {
-      const rows = $('.rows')
-      rows.replaceChildren(); pickerRows.clear()
-      for (const c of catalog) {
-        const label = node('label','row')
-        const box = node('input'); box.type = 'checkbox'; box.value = c.id
+    const pickerDate = new Intl.DateTimeFormat('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false})
+    function renderPicker() {
+      const terms = search.value.toLowerCase().trim().split(/\s+/).filter(Boolean)
+      const matches = [...picker.threads.values()].filter(c => {
+        const text = [c.title,c.cwd,c.id].join(' ').toLowerCase()
+        return terms.every(term => text.includes(term))
+      }).sort((a,b) => (b.recencyAt ?? 0) - (a.recencyAt ?? 0))
+      const rows = $('.rows'), focusedId = shadow.activeElement?.closest('.row input')?.value
+      const fragment = document.createDocumentFragment()
+      pickerRows.clear()
+      for (const c of matches) {
+        const label = node('label','row'), box = node('input'), info = node('span','picker-text')
+        box.type = 'checkbox'; box.value = c.id; box.onchange = () => toggleBound(c.id)
         pickerRows.set(c.id,box)
-        box.onchange = () => toggleBound(c.id)
-        label.append(box,node('span','',c.title)); rows.append(label)
+        const project = c.cwd?.split(/[\\/]/).filter(Boolean).at(-1)
+        info.append(node('span','',c.title),node('small','',project || c.id))
+        label.title = [c.title,c.cwd,c.id].filter(Boolean).join('\n')
+        label.append(box,info)
+        if (c.recencyAt != null) label.append(node('time','',pickerDate.format(new Date(c.recencyAt*1000))))
+        fragment.append(label)
       }
-      if (!catalog.length) rows.textContent = '暂无可选会话'
-      reflectSelection(); dlg.showModal()
+      rows.replaceChildren(fragment)
+      more.hidden = !picker.cursor || picker.loading
+      more.textContent = picker.error ? '重试加载' : '加载更早会话'
+      pickerStatus.textContent = picker.error || (picker.loading ? '正在查找更早的会话…' : !matches.length ? (picker.cursor ? '已加载的会话中没有匹配项' : terms.length ? '没有找到匹配的会话' : '暂无可选会话') : '')
+      reflectSelection()
+      pickerRows.get(focusedId)?.focus({preventScroll:true})
+    }
+    async function loadOlder() {
+      const current = picker
+      if (!current?.cursor || current.loading || !dlg.open || dead) return
+      current.loading = true; current.error = ''; renderPicker()
+      try {
+        const page = await api.call('list',{paged:true,cursor:current.cursor})
+        if (dead || current !== picker || !dlg.open) return
+        for (const row of page.rows) if (!current.threads.has(row.id)) current.threads.set(row.id,row)
+        current.cursor = page.nextCursor !== current.cursor ? page.nextCursor : null
+      } catch(e) { current.error = e.message || '加载更早会话失败' }
+      finally { current.loading = false }
+      if (dead || current !== picker || !dlg.open) return
+      renderPicker()
+      if (search.value.trim() && !current.error && current.cursor) scheduleSearch()
+    }
+    function scheduleSearch() {
+      clearTimeout(searchTimer)
+      if (search.value.trim() && picker?.cursor) searchTimer = setTimeout(loadOlder,250)
+    }
+    search.oninput = () => { renderPicker(); scheduleSearch() }
+    more.onclick = loadOlder
+    dlg.addEventListener('close',() => { clearTimeout(searchTimer); picker = null; pickerRows.clear() })
+    $('.choose').onclick = () => {
+      picker = {threads:new Map(catalog.map(c => [c.id,c])),cursor:catalogCursor}
+      search.value = ''; renderPicker(); dlg.showModal(); search.focus(); $('.rows').scrollTop = 0
     }
     $('.cancel').onclick = () => dlg.close()
     $('.close').onclick = api.back
     $('.choose').disabled = true; tick()
-    return () => { dead = true; clearTimeout(timer); for (const view of views.values()) view.dispose(); preview.dispose(); gallery.close(); api.close?.(); observer.disconnect(); theme.removeEventListener('change',palette); shadow.replaceChildren() }
+    return () => { dead = true; clearTimeout(timer); clearTimeout(searchTimer); for (const view of views.values()) view.dispose(); preview.dispose(); gallery.close(); api.close?.(); observer.disconnect(); theme.removeEventListener('change',palette); shadow.replaceChildren() }
   }
 
   function launcher(root, makeApi, initiallyOpen = false) {

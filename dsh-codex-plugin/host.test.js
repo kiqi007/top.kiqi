@@ -181,3 +181,31 @@ test('Windows drive, URI and UNC links stay within the thread workspace', async 
     assert.equal(windowsPreviewPath(root,path),null)
   }
 })
+
+test('older Desktop sessions remain selectable after a catalog refresh', async () => {
+  const board = Object.create(Board.prototype)
+  const recent = {id:'00000000-0000-4000-8000-000000000001',originator:'Codex Desktop',name:'recent',recencyAt:null,updatedAt:3}
+  const older = {...recent,id:'00000000-0000-4000-8000-000000000002',name:'older',recencyAt:1,updatedAt:9}
+  const cli = {...recent,id:'00000000-0000-4000-8000-000000000003',originator:'cli'}
+  board.cards = new Map()
+  board.call = async (method,params) => {
+    assert.equal(method,'thread/list')
+    assert.equal(params.currentAccountOnly,true)
+    assert.equal(params.sortKey,'recency_at')
+    assert.equal(params.sortDirection,'desc')
+    if (params.includedThreadIds) return {data:[older,cli].filter(t=>params.includedThreadIds.includes(t.id))}
+    return params.cursor ? {data:[cli,older]} : {data:[recent],nextCursor:'older'}
+  }
+  board.attach = async id => board.cards.set(id,{id})
+  board.snapshot = () => board.visibleIds
+  const first = await board.run('list',{paged:true})
+  assert.equal(first.rows[0].recencyAt,3)
+  const next = await board.run('list',{paged:true,cursor:first.nextCursor})
+  assert.equal(next.rows[0].recencyAt,1)
+  assert.deepEqual(next.rows.map(t=>t.id),[older.id])
+  assert.equal(next.nextCursor,null)
+  await board.list()
+  assert.deepEqual(await board.run('watch',{ids:[older.id]}),[older.id])
+  await assert.rejects(board.run('watch',{ids:[cli.id]}),/不可用/)
+  assert.equal(board.cards.has(older.id),true)
+})

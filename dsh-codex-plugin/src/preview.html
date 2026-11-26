@@ -48,9 +48,9 @@
     ['layout','web','核对窄屏会话标题与输入区间距',[]],
     ['assets','web','整理界面截图和设计交付文件',[]],
     ['release','release','复核发布记录与版本说明',[]]
-  ].map(([id,cwd,title,history])=>{
+  ].map(([id,cwd,title,history],index)=>{
     const active = history.find(t=>t.meta.status==='inProgress')
-    return {id,cwd:'/workspace/'+cwd,title,model:'gpt-6.2-sol',modelLabel:'GPT-6.2-Sol',effort:id==='config'?'high':'medium',tier:id==='proxy'?'priority':null,status:{type:active?'active':'idle'},turn:active?.meta.id??null,
+    return {id,recencyAt:Math.floor(demoStart/1000)-index*3600,cwd:'/workspace/'+cwd,title,model:'gpt-6.2-sol',modelLabel:'GPT-6.2-Sol',effort:id==='config'?'high':'medium',tier:id==='proxy'?'priority':null,status:{type:active?'active':'idle'},turn:active?.meta.id??null,
       turns:history.map(t=>t.meta),messages:history.flatMap(t=>t.messages),
       approvals:id==='ui'?[{kind:'文件修改',token:'demo',scope:'src/components/Composer.tsx',decisions:['accept','decline']}]:[]}
   })
@@ -58,7 +58,7 @@
   function makeApi() {
     let bound=[], visible=[]
     async function call(method,p) {
-      if (method==='list') return cards
+      if (method==='list') return p.paged ? {rows:cards,nextCursor:null} : cards
       if (method==='watch'){bound=p.ids;visible=p.visibleIds;revision++}
       const c = cards.find(c=>c.id===p.threadId)
       if (method==='edit') {

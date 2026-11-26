@@ -13,7 +13,7 @@ const uuid = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i
 
 function summary(t) {
   return { id: t.id, title: (t.name || t.preview || '未命名会话').slice(0, 120),
-    cwd: t.cwd, model: t.model, status: t.status, updated: t.updatedAt }
+    cwd: t.cwd, model: t.model, status: t.status, updated: t.updatedAt, recencyAt: t.recencyAt ?? t.updatedAt ?? t.createdAt }
 }
 
 function promptParts(text) {
@@ -193,19 +193,26 @@ export class Board {
     this.revision++
   }
 
-  async list(saved = []) {
-    const query = { currentAccountOnly: true, limit: 100, sortKey: 'updated_at' }
-    const { data } = await this.call('thread/list', query)
-    // Pinned threads can fall outside the recent page between opens.
-    const recent = new Set(data.map(t => t.id))
-    const missing = [...new Set(saved)].filter(id => !recent.has(id) && uuid.test(id))
-    for (let i = 0; i < missing.length; i += 100) {
-      const page = await this.call('thread/list', { ...query, includedThreadIds: missing.slice(i,i+100) })
-      data.push(...page.data)
+  async threadPage(params) {
+    const page = await this.call('thread/list', {
+      currentAccountOnly:true, limit:100, sortKey:'recency_at', sortDirection:'desc', ...params,
+    })
+    const rows = page.data.filter(t => t.originator === 'Codex Desktop' || (!t.originator && t.source === 'vscode')).map(summary)
+    return {rows, nextCursor:page.nextCursor ?? null}
+  }
+
+  async list(saved = [], paged = false, cursor = null) {
+    const page = await this.threadPage({cursor})
+    if (cursor) return page
+    const catalog = new Map(page.rows.map(row => [row.id,row]))
+    const missing = [...new Set(saved)].filter(id => !catalog.has(id) && uuid.test(id)).slice(0,8)
+    if (missing.length) {
+      const pinned = await this.threadPage({includedThreadIds:missing})
+      for (const row of pinned.rows) catalog.set(row.id,row)
     }
-    const rows = data.filter(t => t.originator === 'Codex Desktop' || (!t.originator && t.source === 'vscode')).map(summary)
-    this.catalog = new Map(rows.map(t => [t.id, t]))
-    return [...this.catalog.values()]
+    this.catalog = catalog
+    const rows = [...catalog.values()]
+    return paged ? {rows,nextCursor:page.nextCursor} : rows
   }
 
   async loadModelLabels(provider) {
@@ -332,7 +339,7 @@ export class Board {
   }
 
   async run(op, p) {
-    if (op === 'list') return this.list(Array.isArray(p.bound) ? p.bound : [])
+    if (op === 'list') return this.list(Array.isArray(p.bound) ? p.bound : [], p.paged === true, p.cursor)
     if (op === 'snapshot') {
       for (const card of this.cards.values()) if (card.dirty || card.refreshing) await this.refreshHistory(card)
       return this.snapshot(p.revision)
@@ -340,13 +347,21 @@ export class Board {
     if (op === 'watch') {
       if (this.changing) throw new Error('会话切换中')
       if (Array.isArray(p.ids) && p.ids.length > 8) throw new Error('最多绑定 8 个会话')
-      if (!Array.isArray(p.ids) || new Set(p.ids).size !== p.ids.length || p.ids.some(id => !this.catalog.has(id) && !this.cards.has(id))) throw new Error('请选择列表中的会话')
+      if (!Array.isArray(p.ids) || new Set(p.ids).size !== p.ids.length) throw new Error('请选择列表中的会话')
       const visible = p.visibleIds ?? p.ids.slice(0,4)
       if (!Array.isArray(visible) || visible.length > 4 || new Set(visible).size !== visible.length || visible.some(id => !p.ids.includes(id))) {
         throw new Error('请选择最多四个已绑定会话显示')
       }
       this.changing = true
       try {
+        const missing = p.ids.filter(id => !this.catalog.has(id) && !this.cards.has(id))
+        if (missing.length) {
+          if (!missing.every(id => uuid.test(id))) throw new Error('请选择列表中的会话')
+          const page = await this.threadPage({includedThreadIds:missing})
+          const available = new Map(page.rows.map(row => [row.id,row]))
+          if (!missing.every(id => available.has(id))) throw new Error('所选会话已不可用，请重新选择')
+          for (const id of missing) this.catalog.set(id,available.get(id))
+        }
         for (const id of this.cards.keys()) {
           if (p.ids.includes(id)) continue
           await this.call('thread/unsubscribe', { threadId: id })
