@@ -9,6 +9,7 @@ const approvalKinds = new Map([
 ])
 const methods = new Set(['list', 'watch', 'snapshot', 'details', 'send', 'edit', 'decide', 'close'])
 const editingThreads = new Set()
+const desktopOriginators = new Set(['Codex Desktop', 'codex_work_desktop'])
 const uuid = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i
 
 function summary(t) {
@@ -197,7 +198,7 @@ export class Board {
     const page = await this.call('thread/list', {
       currentAccountOnly:true, limit:100, sortKey:'recency_at', sortDirection:'desc', ...params,
     })
-    const rows = page.data.filter(t => t.originator === 'Codex Desktop' || (!t.originator && t.source === 'vscode')).map(summary)
+    const rows = page.data.filter(t => desktopOriginators.has(t.originator) || (!t.originator && t.source === 'vscode')).map(summary)
     return {rows, nextCursor:page.nextCursor ?? null}
   }
 

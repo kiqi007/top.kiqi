@@ -17,7 +17,7 @@ test('two subscribed threads isolate streamed text, steering and one-time approv
   else server.listen(path)
   await once(server,'listening')
   const seen = []
-  const threads = ['a','b','c','d','e','f','g','h','i'].map((id,i) => ({ id, name:id, cwd:'/work', originator:'Codex Desktop',
+  const threads = ['a','b','c','d','e','f','g','h','i'].map((id,i) => ({ id, name:id, cwd:'/work', originator:i === 1 ? 'codex_work_desktop' : 'Codex Desktop',
     status:{ type:i ? 'active' : 'idle' }, updatedAt:1 }))
   let socket
   ws.on('connection', conn => {
@@ -185,7 +185,7 @@ test('Windows drive, URI and UNC links stay within the thread workspace', async 
 test('older Desktop sessions remain selectable after a catalog refresh', async () => {
   const board = Object.create(Board.prototype)
   const recent = {id:'00000000-0000-4000-8000-000000000001',originator:'Codex Desktop',name:'recent',recencyAt:null,updatedAt:3}
-  const older = {...recent,id:'00000000-0000-4000-8000-000000000002',name:'older',recencyAt:1,updatedAt:9}
+  const older = {...recent,id:'00000000-0000-4000-8000-000000000002',originator:'codex_work_desktop',name:'older',recencyAt:1,updatedAt:9}
   const cli = {...recent,id:'00000000-0000-4000-8000-000000000003',originator:'cli'}
   board.cards = new Map()
   board.call = async (method,params) => {
